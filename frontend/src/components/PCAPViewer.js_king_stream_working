@@ -1,0 +1,226 @@
+import { useState, useEffect } from "react";
+import apiService from "../services/apiService";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Typography,
+  Box,
+  List,
+  ListItem,
+  Divider,
+  Grid,
+  Pagination,
+  CircularProgress,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
+} from "@mui/material";
+
+// Define Wireshark-style coloring rules
+const getRowColor = (protocol) => {
+  const colors = {
+    TCP: "#B4FFB4", // Light Green
+    UDP: "#B4D8FF", // Light Blue
+    ICMP: "#FFF4B4", // Light Yellow
+    ARP: "#FFD1A4", // Light Orange
+    DNS: "#E4B4FF", // Light Purple
+    Default: "#EAEAEA", // Light Gray
+  };
+  return colors[protocol] || colors["Default"];
+};
+
+const PCAPViewer = () => {
+  const [streams, setStreams] = useState([]); // Available TCP Streams
+  const [selectedStream, setSelectedStream] = useState(""); // Currently selected stream
+  const [packets, setPackets] = useState([]); // Packets in selected stream
+  const [selectedPacket, setSelectedPacket] = useState(null);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const limit = 10; // Number of packets per page
+
+  // Fetch available TCP streams on mount
+  useEffect(() => {
+    const fetchStreams = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await apiService.getStreams();
+        setStreams(data || []);
+      } catch (error) {
+        console.error("Failed to fetch streams:", error);
+        setError("Failed to load streams. Please try again.");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchStreams();
+  }, []);
+
+  // Fetch packets for the selected stream with pagination
+  const fetchPackets = async (streamKey, pageNumber = 1) => {
+    if (!streamKey) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await apiService.getStreamPackets(streamKey, pageNumber, limit);
+      setPackets(response.packets || []);
+      setTotalPages(response.totalPages || 1);
+    } catch (error) {
+      console.error("Failed to fetch packets:", error);
+      setError("Failed to load packets. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="p-4 bg-gray-100 min-h-screen flex flex-col">
+      <Typography variant="h4" align="center" gutterBottom>
+        TCP Stream Packet Viewer
+      </Typography>
+
+      {/* Stream Selection */}
+      <FormControl variant="outlined" style={{ minWidth: 300, marginBottom: 10 }}>
+        <InputLabel>Select a Stream</InputLabel>
+        <Select
+          value={selectedStream}
+          onChange={(e) => {
+            setSelectedStream(e.target.value);
+            setPage(1); // Reset pagination
+            fetchPackets(e.target.value, 1);
+          }}
+          label="Select a Stream"
+        >
+          <MenuItem value="">-- Select Stream --</MenuItem>
+          {streams.map((stream, index) => (
+            <MenuItem key={index} value={stream}>
+              {stream}
+            </MenuItem>
+          ))}
+        </Select>
+      </FormControl>
+
+      {/* Loading & Error Handling */}
+      {loading ? (
+        <Box display="flex" justifyContent="center" alignItems="center" height="100px">
+          <CircularProgress />
+        </Box>
+      ) : error ? (
+        <Typography color="error" align="center">{error}</Typography>
+      ) : (
+        <>
+          {/* Packet Table */}
+          <TableContainer component={Paper} className="shadow-md overflow-auto" style={{ height: "300px" }}>
+            <Table>
+              <TableHead>
+                <TableRow className="bg-gray-800 text-white">
+                  <TableCell>No.</TableCell>
+                  <TableCell>Time</TableCell>
+                  <TableCell>Source</TableCell>
+                  <TableCell>Destination</TableCell>
+                  <TableCell>Protocol</TableCell>
+                  <TableCell>Length</TableCell>
+                  <TableCell>HTTP Data</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {packets.length > 0 ? (
+                  packets.map((packet, index) => (
+                    <TableRow
+                      key={index}
+                      style={{
+                        backgroundColor: getRowColor(packet.protocol),
+                        cursor: "pointer",
+                      }}
+                    >
+                      <TableCell>
+                        <a
+                          href="#"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            setSelectedPacket(packet);
+                          }}
+                          className="text-blue-500 underline hover:text-blue-700"
+                        >
+                          {index + 1 + (page - 1) * limit}
+                        </a>
+                      </TableCell>
+                      <TableCell>{packet.timestamp}</TableCell>
+                      <TableCell>{packet.src_ip}:{packet.src_port}</TableCell>
+                      <TableCell>{packet.dst_ip}:{packet.dst_port}</TableCell>
+                      <TableCell>{packet.protocol}</TableCell>
+                      <TableCell>{packet.length}</TableCell>
+                      <TableCell>{packet.http_data ? packet.http_data : "N/A"}</TableCell>
+                    </TableRow>
+                  ))
+                ) : (
+                  <TableRow>
+                    <TableCell colSpan={7} align="center">
+                      No packets available
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+
+          {/* Pagination */}
+          <Box display="flex" justifyContent="center" mt={2}>
+            <Pagination
+              count={totalPages}
+              page={page}
+              onChange={(event, value) => {
+                setPage(value);
+                fetchPackets(selectedStream, value);
+              }}
+              color="primary"
+            />
+          </Box>
+
+          <Divider className="my-2" />
+
+          {/* Packet Details & Packet Bytes */}
+          {selectedPacket && (
+            <Grid container spacing={2} style={{ height: "calc(100vh - 400px)" }}>
+              <Grid item xs={6}>
+                <Box className="p-4 border rounded bg-white shadow-md h-full overflow-auto">
+                  <Typography variant="h6" className="font-bold">Packet Details</Typography>
+                  <List>
+                    <ListItem>Frame: {selectedPacket.length} bytes</ListItem>
+                    <ListItem>Ethernet: Src → {selectedPacket.src_ip}, Dst → {selectedPacket.dst_ip}</ListItem>
+                    <ListItem>Protocol: {selectedPacket.protocol}</ListItem>
+                  </List>
+                </Box>
+              </Grid>
+              <Grid item xs={6}>
+                <Box className="p-4 border rounded bg-white shadow-md h-full overflow-auto">
+                  <Typography variant="h6" className="font-bold">Packet Bytes</Typography>
+                  {selectedPacket.packet_dump ? (
+                    <pre className="overflow-auto p-2 bg-gray-100 border">
+                      {selectedPacket.packet_dump}
+                    </pre>
+                  ) : (
+                    <Typography className="text-center text-gray-500 mt-4">
+                      No Data Found
+                    </Typography>
+                  )}
+                </Box>
+              </Grid>
+            </Grid>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
+export default PCAPViewer;
