@@ -1,0 +1,251 @@
+package main
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	//"strconv"
+	"sync"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
+	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
+)
+
+// PacketData stores packet information
+type PacketData struct {
+	Index        int    `json:"index"`
+	Timestamp    string `json:"timestamp"`
+	SrcIP        string `json:"src_ip"`
+	SrcPort      uint16 `json:"src_port"`
+	DstIP        string `json:"dst_ip"`
+	DstPort      uint16 `json:"dst_port"`
+	Protocol     string `json:"protocol"`
+	Length       int    `json:"length"`
+	PayloadHex   string `json:"payload_hex,omitempty"`
+	PayloadASCII string `json:"payload_ascii,omitempty"`
+	PacketDump   string `json:"packet_dump,omitempty"`
+}
+
+var (
+	packetStore  sync.Map // Thread-safe storage for packets
+	streamsStore sync.Map // Thread-safe storage for TCP streams
+	packetMutex  sync.Mutex
+	packetChan   = make(chan PacketData, 100)
+)
+
+// Format packet payload as structured hex dump
+func formatHexDump(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+
+	dump := ""
+	for i := 0; i < len(data); i += 16 {
+		line := fmt.Sprintf("%08X: ", i)
+		hexPart := ""
+		asciiPart := ""
+
+		for j := 0; j < 16 && (i+j) < len(data); j++ {
+			byteVal := data[i+j]
+			hexPart += fmt.Sprintf("%02X ", byteVal)
+			if byteVal >= 32 && byteVal <= 126 {
+				asciiPart += string(byteVal)
+			} else {
+				asciiPart += "."
+			}
+		}
+		dump += fmt.Sprintf("%-50s %s\n", line+hexPart, asciiPart)
+	}
+	return dump
+}
+
+// Load packets from a PCAP file
+func loadPackets(filename string) {
+	handle, err := pcap.OpenOffline(filename)
+	if err != nil {
+		log.Fatal("Error opening pcap file:", err)
+	}
+	defer handle.Close()
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+
+	index := 1
+	for packet := range packetSource.Packets() {
+		packetData := processPacket(packet, index)
+		packetChan <- packetData
+		index++
+	}
+
+	close(packetChan)
+
+	// Collect packets from the channel
+	for packet := range packetChan {
+		packetStore.Store(packet.Index, packet)
+	}
+}
+
+// Process an individual packet
+func processPacket(packet gopacket.Packet, index int) PacketData {
+	var srcIP, dstIP string
+	var srcPort, dstPort uint16
+	var protocol, payloadHex, payloadASCII, packetDump string
+
+	length := len(packet.Data())
+
+	if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
+		ip, _ := ipLayer.(*layers.IPv4)
+		srcIP = ip.SrcIP.String()
+		dstIP = ip.DstIP.String()
+		protocol = ip.Protocol.String()
+	}
+
+	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+		tcp, _ := tcpLayer.(*layers.TCP)
+		srcPort = uint16(tcp.SrcPort)
+		dstPort = uint16(tcp.DstPort)
+		if len(tcp.Payload) > 0 {
+			payloadHex = hex.EncodeToString(tcp.Payload)
+			payloadASCII = string(tcp.Payload)
+			packetDump = formatHexDump(tcp.Payload)
+		}
+
+		// Store TCP streams
+		streamKey := fmt.Sprintf("%s:%d -> %s:%d", srcIP, srcPort, dstIP, dstPort)
+		if stream, exists := streamsStore.Load(streamKey); exists {
+			streamsStore.Store(streamKey, append(stream.([]PacketData), PacketData{
+				Index:        index,
+				Timestamp:    packet.Metadata().Timestamp.String(),
+				SrcIP:        srcIP,
+				SrcPort:      srcPort,
+				DstIP:        dstIP,
+				DstPort:      dstPort,
+				Protocol:     protocol,
+				Length:       length,
+				PayloadHex:   payloadHex,
+				PayloadASCII: payloadASCII,
+				PacketDump:   packetDump,
+			}))
+		} else {
+			streamsStore.Store(streamKey, []PacketData{
+				{
+					Index:        index,
+					Timestamp:    packet.Metadata().Timestamp.String(),
+					SrcIP:        srcIP,
+					SrcPort:      srcPort,
+					DstIP:        dstIP,
+					DstPort:      dstPort,
+					Protocol:     protocol,
+					Length:       length,
+					PayloadHex:   payloadHex,
+					PayloadASCII: payloadASCII,
+					PacketDump:   packetDump,
+				},
+			})
+		}
+	}
+
+	return PacketData{
+		Index:        index,
+		Timestamp:    packet.Metadata().Timestamp.String(),
+		SrcIP:        srcIP,
+		SrcPort:      srcPort,
+		DstIP:        dstIP,
+		DstPort:      dstPort,
+		Protocol:     protocol,
+		Length:       length,
+		PayloadHex:   payloadHex,
+		PayloadASCII: payloadASCII,
+		PacketDump:   packetDump,
+	}
+}
+
+// API Handler: Fetch all available streams
+func getStreamsHandler(w http.ResponseWriter, r *http.Request) {
+	var streamKeys []string
+	streamsStore.Range(func(key, _ interface{}) bool {
+		streamKeys = append(streamKeys, key.(string))
+		return true
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(streamKeys)
+}
+
+// API Handler: Fetch a specific stream's packets
+func followStreamHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	streamKey := vars["stream"]
+
+	// Fetch packets from the stream store
+	if stream, exists := streamsStore.Load(streamKey); exists {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stream)
+	} else {
+		http.Error(w, "Stream not found", http.StatusNotFound)
+	}
+}
+
+// API Handler: Upload PCAP file
+func uploadPcapHandler(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseMultipartForm(10 << 20) // 10MB max file size
+	if err != nil {
+		http.Error(w, "File size too large", http.StatusBadRequest)
+		return
+	}
+
+	file, handler, err := r.FormFile("pcap")
+	if err != nil {
+		http.Error(w, "Failed to retrieve file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	uploadDir := "./uploads"
+	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
+		os.Mkdir(uploadDir, os.ModePerm)
+	}
+
+	filePath := filepath.Join(uploadDir, handler.Filename)
+	dst, err := os.Create(filePath)
+	if err != nil {
+		http.Error(w, "Failed to save file", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, file)
+	if err != nil {
+		http.Error(w, "Failed to write file", http.StatusInternalServerError)
+		return
+	}
+
+	// Process uploaded file asynchronously
+	go loadPackets(filePath)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":  "File uploaded successfully",
+		"filename": handler.Filename,
+	})
+}
+
+func main() {
+	router := mux.NewRouter()
+	router.HandleFunc("/packets", getStreamsHandler).Methods("GET")
+	router.HandleFunc("/upload-pcap", uploadPcapHandler).Methods("POST")
+	router.HandleFunc("/streams", getStreamsHandler).Methods("GET")
+	router.HandleFunc("/stream/{stream}", followStreamHandler).Methods("GET")
+
+	loggedRouter := handlers.LoggingHandler(os.Stdout, handlers.CORS()(router))
+
+	fmt.Println("Server running on :8080")
+	log.Fatal(http.ListenAndServe(":8080", loggedRouter))
+}
